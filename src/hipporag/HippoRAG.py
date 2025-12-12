@@ -12,7 +12,7 @@ from concurrent.futures import ThreadPoolExecutor
 from tqdm import tqdm
 from igraph import Graph
 import igraph as ig
-import numpy as np
+import spacy
 from collections import defaultdict
 import re
 import time
@@ -33,6 +33,8 @@ from .utils.misc_utils import NerRawOutput, TripleRawOutput
 from .utils.embed_utils import retrieve_knn
 from .utils.typing import Triple
 from .utils.config_utils import BaseConfig
+from sentence_transformers import CrossEncoder
+
 
 logger = logging.getLogger(__name__)
 
@@ -162,6 +164,23 @@ class HippoRAG:
         self.all_retrieval_time = 0
 
         self.ent_node_to_chunk_ids = None
+
+        # ajejc
+        # 2025.12.12
+        # 1. 实例化 NER 模型
+        try:
+            # 使用小型英文模型，用于实体识别
+            self.ner_model = spacy.load("en_core_web_lg")
+        except Exception as e:
+            # 如果模型加载失败，打印警告并设置 ner_model 为 None，确保程序不会崩溃
+            print(f"Warning: Failed to load spaCy model: {e}. NER enhancement will be skipped.")
+            self.ner_model = None
+
+        # 2. 定义 NER 增强超参数
+        # 建议从 3.0 开始尝试，以提供足够的权重提升
+        self.alpha_ner = 3.0 
+        # 定义一个基础权重，用于实体存在但初始得分过低的情况（防止遗漏）
+        self.base_ner_weight = 0.01
 
 
     def initialize_graph(self):
@@ -428,6 +447,9 @@ class HippoRAG:
             top_k_docs = [self.chunk_embedding_store.get_row(self.passage_node_keys[idx])["content"] for idx in sorted_doc_ids[:num_to_retrieve]]
 
             retrieval_results.append(QuerySolution(question=query, docs=top_k_docs, doc_scores=sorted_doc_scores[:num_to_retrieve]))
+            # ajejc
+            # 2025.12.10
+
 
         retrieve_end_time = time.time()  # Record end time
 
@@ -1404,37 +1426,134 @@ class HippoRAG:
         assert np.count_nonzero(all_phrase_weights) == len(linking_score_map.keys())
         return all_phrase_weights, linking_score_map
 
+    # def graph_search_with_fact_entities(self, query: str,
+    #                                     link_top_k: int,
+    #                                     query_fact_scores: np.ndarray,
+    #                                     top_k_facts: List[Tuple],
+    #                                     top_k_fact_indices: List[str],
+    #                                     passage_node_weight: float = 0.05) -> Tuple[np.ndarray, np.ndarray]:
+    #     """
+    #     Computes document scores based on fact-based similarity and relevance using personalized
+    #     PageRank (PPR) and dense retrieval models. This function combines the signal from the relevant
+    #     facts identified with passage similarity and graph-based search for enhanced result ranking.
+
+    #     Parameters:
+    #         query (str): The input query string for which similarity and relevance computations
+    #             need to be performed.
+    #         link_top_k (int): The number of top phrases to include from the linking score map for
+    #             downstream processing.
+    #         query_fact_scores (np.ndarray): An array of scores representing fact-query similarity
+    #             for each of the provided facts.
+    #         top_k_facts (List[Tuple]): A list of top-ranked facts, where each fact is represented
+    #             as a tuple of its subject, predicate, and object.
+    #         top_k_fact_indices (List[str]): Corresponding indices or identifiers for the top-ranked
+    #             facts in the query_fact_scores array.
+    #         passage_node_weight (float): Default weight to scale passage scores in the graph.
+
+    #     Returns:
+    #         Tuple[np.ndarray, np.ndarray]: A tuple containing two arrays:
+    #             - The first array corresponds to document IDs sorted based on their scores.
+    #             - The second array consists of the PPR scores associated with the sorted document IDs.
+    #     """
+
+    #     #Assigning phrase weights based on selected facts from previous steps.
+    #     linking_score_map = {}  # from phrase to the average scores of the facts that contain the phrase
+    #     phrase_scores = {}  # store all fact scores for each phrase regardless of whether they exist in the knowledge graph or not
+    #     phrase_weights = np.zeros(len(self.graph.vs['name']))
+    #     passage_weights = np.zeros(len(self.graph.vs['name']))
+    #     number_of_occurs = np.zeros(len(self.graph.vs['name']))
+
+    #     phrases_and_ids = set()
+
+    #     for rank, f in enumerate(top_k_facts):
+    #         subject_phrase = f[0].lower()
+    #         predicate_phrase = f[1].lower()
+    #         object_phrase = f[2].lower()
+    #         fact_score = query_fact_scores[
+    #             top_k_fact_indices[rank]] if query_fact_scores.ndim > 0 else query_fact_scores
+
+    #         for phrase in [subject_phrase, object_phrase]:
+    #             phrase_key = compute_mdhash_id(
+    #                 content=phrase,
+    #                 prefix="entity-"
+    #             )
+    #             phrase_id = self.node_name_to_vertex_idx.get(phrase_key, None)
+
+    #             if phrase_id is not None:
+    #                 weighted_fact_score = fact_score
+
+    #                 if len(self.ent_node_to_chunk_ids.get(phrase_key, set())) > 0:
+    #                     weighted_fact_score /= len(self.ent_node_to_chunk_ids[phrase_key])
+
+    #                 phrase_weights[phrase_id] += weighted_fact_score
+    #                 number_of_occurs[phrase_id] += 1
+
+    #             phrases_and_ids.add((phrase, phrase_id))
+
+    #     phrase_weights /= number_of_occurs
+
+    #     for phrase, phrase_id in phrases_and_ids:
+    #         if phrase not in phrase_scores:
+    #             phrase_scores[phrase] = []
+
+    #         phrase_scores[phrase].append(phrase_weights[phrase_id])
+
+    #     # calculate average fact score for each phrase
+    #     for phrase, scores in phrase_scores.items():
+    #         linking_score_map[phrase] = float(np.mean(scores))
+
+    #     if link_top_k:
+    #         phrase_weights, linking_score_map = self.get_top_k_weights(link_top_k,
+    #                                                                        phrase_weights,
+    #                                                                        linking_score_map)  # at this stage, the length of linking_scope_map is determined by link_top_k
+
+    #     #Get passage scores according to chosen dense retrieval model
+    #     dpr_sorted_doc_ids, dpr_sorted_doc_scores = self.dense_passage_retrieval(query)
+    #     normalized_dpr_sorted_scores = min_max_normalize(dpr_sorted_doc_scores)
+
+    #     for i, dpr_sorted_doc_id in enumerate(dpr_sorted_doc_ids.tolist()):
+    #         passage_node_key = self.passage_node_keys[dpr_sorted_doc_id]
+    #         passage_dpr_score = normalized_dpr_sorted_scores[i]
+    #         passage_node_id = self.node_name_to_vertex_idx[passage_node_key]
+    #         passage_weights[passage_node_id] = passage_dpr_score * passage_node_weight
+    #         passage_node_text = self.chunk_embedding_store.get_row(passage_node_key)["content"]
+    #         linking_score_map[passage_node_text] = passage_dpr_score * passage_node_weight
+
+    #     #Combining phrase and passage scores into one array for PPR
+    #     node_weights = phrase_weights + passage_weights
+
+    #     #Recording top 30 facts in linking_score_map
+    #     if len(linking_score_map) > 30:
+    #         linking_score_map = dict(sorted(linking_score_map.items(), key=lambda x: x[1], reverse=True)[:30])
+
+    #     assert sum(node_weights) > 0, f'No phrases found in the graph for the given facts: {top_k_facts}'
+
+    #     #Running PPR algorithm based on the passage and phrase weights previously assigned
+    #     ppr_start = time.time()
+    #     ppr_sorted_doc_ids, ppr_sorted_doc_scores = self.run_ppr(node_weights, damping=self.global_config.damping)
+    #     ppr_end = time.time()
+
+    #     self.ppr_time += (ppr_end - ppr_start)
+
+    #     assert len(ppr_sorted_doc_ids) == len(
+    #         self.passage_node_idxs), f"Doc prob length {len(ppr_sorted_doc_ids)} != corpus length {len(self.passage_node_idxs)}"
+
+    #     return ppr_sorted_doc_ids, ppr_sorted_doc_scores
+    # ajejc
+    # 2025.12.12
     def graph_search_with_fact_entities(self, query: str,
-                                        link_top_k: int,
-                                        query_fact_scores: np.ndarray,
-                                        top_k_facts: List[Tuple],
-                                        top_k_fact_indices: List[str],
-                                        passage_node_weight: float = 0.05) -> Tuple[np.ndarray, np.ndarray]:
+                                    link_top_k: int,
+                                    query_fact_scores: np.ndarray,
+                                    top_k_facts: List[Tuple],
+                                    top_k_fact_indices: List[str],
+                                    passage_node_weight: float = 0.05) -> Tuple[np.ndarray, np.ndarray]:
         """
-        Computes document scores based on fact-based similarity and relevance using personalized
-        PageRank (PPR) and dense retrieval models. This function combines the signal from the relevant
-        facts identified with passage similarity and graph-based search for enhanced result ranking.
-
-        Parameters:
-            query (str): The input query string for which similarity and relevance computations
-                need to be performed.
-            link_top_k (int): The number of top phrases to include from the linking score map for
-                downstream processing.
-            query_fact_scores (np.ndarray): An array of scores representing fact-query similarity
-                for each of the provided facts.
-            top_k_facts (List[Tuple]): A list of top-ranked facts, where each fact is represented
-                as a tuple of its subject, predicate, and object.
-            top_k_fact_indices (List[str]): Corresponding indices or identifiers for the top-ranked
-                facts in the query_fact_scores array.
-            passage_node_weight (float): Default weight to scale passage scores in the graph.
-
-        Returns:
-            Tuple[np.ndarray, np.ndarray]: A tuple containing two arrays:
-                - The first array corresponds to document IDs sorted based on their scores.
-                - The second array consists of the PPR scores associated with the sorted document IDs.
+        HippoRAG Graph Search with NER-Enhanced Initial Energy.
         """
 
-        #Assigning phrase weights based on selected facts from previous steps.
+        # --- 原始代码：计算 phrase_weights 和 passage_weights 的部分 ---
+        
+        # Assigning phrase weights based on selected facts from previous steps.
         linking_score_map = {}  # from phrase to the average scores of the facts that contain the phrase
         phrase_scores = {}  # store all fact scores for each phrase regardless of whether they exist in the knowledge graph or not
         phrase_weights = np.zeros(len(self.graph.vs['name']))
@@ -1468,24 +1587,26 @@ class HippoRAG:
 
                 phrases_and_ids.add((phrase, phrase_id))
 
-        phrase_weights /= number_of_occurs
+        # Avoid division by zero
+        phrase_weights /= np.where(number_of_occurs > 0, number_of_occurs, 1)
 
+        # ... (省略 phrase_scores 和 linking_score_map 的计算，与原始代码一致) ...
         for phrase, phrase_id in phrases_and_ids:
-            if phrase not in phrase_scores:
-                phrase_scores[phrase] = []
-
-            phrase_scores[phrase].append(phrase_weights[phrase_id])
-
-        # calculate average fact score for each phrase
+            if phrase_id is not None:
+                if phrase not in phrase_scores:
+                    phrase_scores[phrase] = []
+                phrase_scores[phrase].append(phrase_weights[phrase_id])
+        
         for phrase, scores in phrase_scores.items():
             linking_score_map[phrase] = float(np.mean(scores))
 
         if link_top_k:
             phrase_weights, linking_score_map = self.get_top_k_weights(link_top_k,
-                                                                           phrase_weights,
-                                                                           linking_score_map)  # at this stage, the length of linking_scope_map is determined by link_top_k
+                                                                        phrase_weights,
+                                                                        linking_score_map)
 
-        #Get passage scores according to chosen dense retrieval model
+
+        # Get passage scores according to chosen dense retrieval model
         dpr_sorted_doc_ids, dpr_sorted_doc_scores = self.dense_passage_retrieval(query)
         normalized_dpr_sorted_scores = min_max_normalize(dpr_sorted_doc_scores)
 
@@ -1497,24 +1618,62 @@ class HippoRAG:
             passage_node_text = self.chunk_embedding_store.get_row(passage_node_key)["content"]
             linking_score_map[passage_node_text] = passage_dpr_score * passage_node_weight
 
-        #Combining phrase and passage scores into one array for PPR
+
+        # =================================================================
+        # =============== 【NER 实体感知增强逻辑 - NEW】 ====================
+        # =================================================================
+        if self.ner_model is not None:
+            try:
+                # 1. 提取 Query 中的命名实体
+                doc = self.ner_model(query)
+                query_entities = [ent.text.lower() for ent in doc.ents]
+                
+                for entity_text in set(query_entities):
+                    # 2. 找到对应的图谱实体节点 ID
+                    phrase_key = compute_mdhash_id(
+                        content=entity_text, # 已经是小写
+                        prefix="entity-"
+                    )
+                    phrase_id = self.node_name_to_vertex_idx.get(phrase_key, None)
+
+                    if phrase_id is not None:
+                        # 3. 对匹配的实体节点进行乘法增强
+                        
+                        # 场景 A: 原始点积得分 > 0 （确认相关，给予加倍提升）
+                        if phrase_weights[phrase_id] > 0:
+                            phrase_weights[phrase_id] *= self.alpha_ner
+                        
+                        # 场景 B: 原始点积得分 <= 0 但实体存在于图谱中（防止因低分被忽略）
+                        elif self.ent_node_to_chunk_ids.get(phrase_key, set()):
+                            # 赋予基础分，让 PPR 游走有机会触达这个关键实体
+                            phrase_weights[phrase_id] = self.base_ner_weight
+
+            except Exception as e:
+                # 如果 NER 过程出现任何错误，记录日志并继续，不影响原始流程
+                print(f"Warning: NER enhancement failed: {e}")
+
+
+        # =================================================================
+        # --- 原始代码：结合权重并运行 PPR ---
+        # =================================================================
+        
+        # Combining phrase and passage scores into one array for PPR
         node_weights = phrase_weights + passage_weights
 
-        #Recording top 30 facts in linking_score_map
+        # Recording top 30 facts in linking_score_map
         if len(linking_score_map) > 30:
             linking_score_map = dict(sorted(linking_score_map.items(), key=lambda x: x[1], reverse=True)[:30])
 
+        # 如果所有权重都被归零（理论上不应该，但为保险起见），则回退
+        if np.sum(node_weights) == 0: 
+            print(f'No entities found in the graph for the given facts and query, defaulting to DPR.')
+            # 此时可以回退到纯 DPR 结果
+            return dpr_sorted_doc_ids, dpr_sorted_doc_scores
+
         assert sum(node_weights) > 0, f'No phrases found in the graph for the given facts: {top_k_facts}'
 
-        #Running PPR algorithm based on the passage and phrase weights previously assigned
-        ppr_start = time.time()
+        # Running PPR algorithm based on the passage and phrase weights previously assigned
         ppr_sorted_doc_ids, ppr_sorted_doc_scores = self.run_ppr(node_weights, damping=self.global_config.damping)
-        ppr_end = time.time()
-
-        self.ppr_time += (ppr_end - ppr_start)
-
-        assert len(ppr_sorted_doc_ids) == len(
-            self.passage_node_idxs), f"Doc prob length {len(ppr_sorted_doc_ids)} != corpus length {len(self.passage_node_idxs)}"
 
         return ppr_sorted_doc_ids, ppr_sorted_doc_scores
 
@@ -1610,3 +1769,10 @@ class HippoRAG:
         sorted_doc_scores = doc_scores[sorted_doc_ids.tolist()]
 
         return sorted_doc_ids, sorted_doc_scores
+
+        # ajejc
+        # 2025.12.11
+    
+
+
+
